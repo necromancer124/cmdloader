@@ -37,7 +37,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "DownRim Universal"
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 DEFAULT_RIMWORLD_APPID = 294100
 COLLECTION_API = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/"
 PUBLISHEDFILE_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
@@ -437,9 +437,45 @@ def install_steamcmd(target_dir: Path, log=None) -> Path:
     return exe
 
 
-def looks_like_steam_guard(output: str) -> bool:
+def steam_login_succeeded(output: str) -> bool:
+    s = output or ""
+    return "to Steam Public...OK" in s or "Waiting for user info...OK" in s
+
+
+def steam_guard_needs_action(output: str) -> bool:
+    """True only when Steam Guard/2FA is actually blocking login.
+
+    SteamCMD prints "protected by a Steam Guard mobile authenticator" even when
+    the user approves the login successfully. Treat that as informational unless
+    the login times out/fails before Steam Public...OK / user info OK.
+    """
     s = (output or "").lower()
-    return any(k in s for k in ("steam guard", "two-factor", "two factor", "auth code", "email code", "phone code"))
+    if steam_login_succeeded(output):
+        return False
+    blocking_terms = (
+        "wait for confirmation timed out",
+        "timed out waiting for confirmation",
+        "error (timeout)",
+        "auth code",
+        "email code",
+        "phone code",
+        "two-factor",
+        "two factor",
+    )
+    return any(k in s for k in blocking_terms)
+
+
+def steamcmd_failure_hint(login: str, login_ok: bool) -> str:
+    if login == "user" and login_ok:
+        return (
+            "Steam login succeeded, so this is probably not your username/password or Steam Guard. "
+            "SteamCMD itself refused this Workshop file. Make sure the Steam account owns the game, "
+            "open the item in the normal Steam client and Subscribe to it, then try again. Some games/items "
+            "can only be installed by the Steam client and cannot be bypassed by SteamCMD."
+        )
+    if login == "user":
+        return "Steam Guard / 2FA did not finish. Approve the Steam Mobile prompt or use Fix Steam Guard / 2FA login once, then retry."
+    return "Anonymous SteamCMD was refused. Try Steam login=user with the Steam account that owns the game, and subscribe to the item in Steam if needed."
 
 
 @dataclass
@@ -564,9 +600,9 @@ def perform_downloads(item_ids: List[str], options: DownloadOptions, log=print, 
                 log(f"[BATCH] AppID {appid}, batch {batch_no}, attempt {attempt}: {len(batch)} item(s)")
                 result = run_steamcmd(args, app_dir(), last_log, dry_run=options.dry_run, stop_event=stop_event, progress=batch_progress)
                 output = (result.get("stdout", "") + "\n" + result.get("stderr", ""))
-                if options.login == "user" and looks_like_steam_guard(output):
-                    report["notes"].append("Steam Guard / 2FA detected. Run steamcmd.exe manually once to complete login, then retry.")
-                    log("[WARN] Steam Guard / 2FA detected. Complete login manually, then retry.")
+                if options.login == "user" and steam_guard_needs_action(output):
+                    report["notes"].append("Steam Guard / 2FA is blocking login. Use Fix Steam Guard / 2FA login, approve in Steam Mobile, then retry.")
+                    log("[WARN] Steam Guard / 2FA is blocking login. Approve the Steam Mobile prompt or use Fix Steam Guard / 2FA login, then retry.")
                     break
                 if result["returncode"] == 0:
                     break
@@ -597,7 +633,7 @@ def perform_downloads(item_ids: List[str], options: DownloadOptions, log=print, 
                 info["title"] = title
                 if wid in failed_events:
                     info["steamcmd_error"] = failed_events[wid]
-                    info["hint"] = "SteamCMD reported Failure. If user login is already enabled, confirm the Steam Mobile login request, run Fix Steam Guard / 2FA login once, and check the item is not removed/private/paid/region-locked."
+                    info["hint"] = steamcmd_failure_hint(options.login, steam_login_succeeded(output))
                 report["items"][wid] = info
                 if not info["downloaded"] and not options.dry_run:
                     any_fail = True
@@ -613,10 +649,7 @@ def perform_downloads(item_ids: List[str], options: DownloadOptions, log=print, 
                     else:
                         reason = failed_events.get(wid, "No downloaded files were found after SteamCMD finished.")
                         log(f"[FAILED] {wid} ({title}) AppID {appid}: {reason}")
-                        if options.login == "user":
-                            log("         Hint: logged-in SteamCMD still failed. Confirm the Steam Mobile login request, use Fix Steam Guard / 2FA login once, and check the item is not removed/private/paid/region-locked.")
-                        else:
-                            log("         Hint: if this is a public item but SteamCMD says Failure, try Steam login=user. Also check the item is not removed/private/paid/region-locked and AppID is correct.")
+                        log("         Hint: " + steamcmd_failure_hint(options.login, steam_login_succeeded(output)))
                     if progress:
                         progress({
                             "kind": "overall",
