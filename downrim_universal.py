@@ -37,7 +37,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "DownRim Universal"
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 DEFAULT_RIMWORLD_APPID = 294100
 COLLECTION_API = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/"
 PUBLISHEDFILE_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
@@ -247,20 +247,30 @@ def resolve_appids(item_ids: List[str], appid: Optional[int], timeout: int, log=
 
 
 def sanitize_args(args: List[str]) -> List[str]:
+    """Mask secrets before logs/reports. SteamCMD login syntax is +login <user> <password>."""
     out = list(args)
     try:
         i = out.index("+login")
-        if i + 1 < len(out) and out[i + 1] != "anonymous" and i + 3 < len(out):
-            out[i + 3] = "********"
+        if i + 1 < len(out) and out[i + 1] != "anonymous" and i + 2 < len(out):
+            out[i + 2] = "********"
     except ValueError:
         pass
     return out
 
 
-def build_steamcmd_args(steamcmd: Path, login: str, username: Optional[str], password: Optional[str], appid: int, ids: List[str], download_dir: Path) -> List[str]:
+def build_steamcmd_args(
+    steamcmd: Path,
+    login: str,
+    username: Optional[str],
+    password: Optional[str],
+    appid: int,
+    ids: List[str],
+    download_dir: Path,
+    stop_on_failed_command: bool = True,
+) -> List[str]:
     download_dir = Path(download_dir).expanduser().resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
-    args = [str(steamcmd), "+@ShutdownOnFailedCommand", "1", "+@NoPromptForPassword", "1", "+force_install_dir", str(download_dir)]
+    args = [str(steamcmd), "+@ShutdownOnFailedCommand", "1" if stop_on_failed_command else "0", "+@NoPromptForPassword", "1", "+force_install_dir", str(download_dir)]
     if login == "anonymous":
         args += ["+login", "anonymous"]
     else:
@@ -501,14 +511,30 @@ def perform_downloads(item_ids: List[str], options: DownloadOptions, log=print, 
                     progress({"kind": "overall", "processed": processed_items, "total": total_items, "percent": (processed_items / total_items) * 100 if total_items else 100})
                 log(f"[INFO] AppID {appid}: skipping {len(skipped)} already-downloaded item(s).")
         log(f"[INFO] AppID {appid}: {len(to_download)} item(s) to download.")
-        effective_batch_size = 1 if not options.dry_run else max(1, int(options.batch_size))
-        if to_download and effective_batch_size == 1 and int(options.batch_size) != 1:
-            log("[INFO] Live item progress mode: running one Workshop item at a time so the progress bar updates after each item.")
+        if options.login == "user" and not options.dry_run:
+            # Use one SteamCMD process per AppID for authenticated downloads. Otherwise
+            # Steam Guard mobile confirmation can be requested once per item and later
+            # items time out while the user thinks they are already logged in.
+            effective_batch_size = max(1, len(to_download))
+            log("[INFO] Authenticated mode: using one SteamCMD session for this AppID to avoid repeated Steam Guard prompts.")
+        else:
+            effective_batch_size = 1 if not options.dry_run else max(1, int(options.batch_size))
+            if to_download and effective_batch_size == 1 and int(options.batch_size) != 1:
+                log("[INFO] Live item progress mode: running one Workshop item at a time so the progress bar updates after each item.")
         for batch_no, batch in enumerate(chunks(to_download, effective_batch_size), 1):
             if stop_event is not None and stop_event.is_set():
                 report["notes"].append("Stopped by user.")
                 return report
-            args = build_steamcmd_args(options.steamcmd, options.login, options.username, options.password, appid, batch, options.download_dir)
+            args = build_steamcmd_args(
+                options.steamcmd,
+                options.login,
+                options.username,
+                options.password,
+                appid,
+                batch,
+                options.download_dir,
+                stop_on_failed_command=not (options.login == "user" and not options.dry_run),
+            )
             result = None
             last_log = None
             batch_reported_done: set[str] = set()
@@ -571,7 +597,7 @@ def perform_downloads(item_ids: List[str], options: DownloadOptions, log=print, 
                 info["title"] = title
                 if wid in failed_events:
                     info["steamcmd_error"] = failed_events[wid]
-                    info["hint"] = "SteamCMD reported Failure. For many games this means anonymous Workshop download is blocked; try Steam login=user with your Steam account login name, or confirm the item is public and belongs to this AppID."
+                    info["hint"] = "SteamCMD reported Failure. If user login is already enabled, confirm the Steam Mobile login request, run Fix Steam Guard / 2FA login once, and check the item is not removed/private/paid/region-locked."
                 report["items"][wid] = info
                 if not info["downloaded"] and not options.dry_run:
                     any_fail = True
@@ -587,7 +613,10 @@ def perform_downloads(item_ids: List[str], options: DownloadOptions, log=print, 
                     else:
                         reason = failed_events.get(wid, "No downloaded files were found after SteamCMD finished.")
                         log(f"[FAILED] {wid} ({title}) AppID {appid}: {reason}")
-                        log("         Hint: if this is a public item but SteamCMD says Failure, try Steam login=user. Also check the item is not removed/private/paid/region-locked and AppID is correct.")
+                        if options.login == "user":
+                            log("         Hint: logged-in SteamCMD still failed. Confirm the Steam Mobile login request, use Fix Steam Guard / 2FA login once, and check the item is not removed/private/paid/region-locked.")
+                        else:
+                            log("         Hint: if this is a public item but SteamCMD says Failure, try Steam login=user. Also check the item is not removed/private/paid/region-locked and AppID is correct.")
                     if progress:
                         progress({
                             "kind": "overall",
